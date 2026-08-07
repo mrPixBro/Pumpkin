@@ -505,32 +505,48 @@ impl PendingConnection {
         if resource_config.enabled {
             use pumpkin_protocol::java::server::config::ResourcePackResponseResult;
             match packet.response_result() {
+                // Не терминальный ответ: клиент только согласился качать, о
+                // результате скажет следующим пакетом. Продолжим тогда.
+                ResourcePackResponseResult::Accepted => return,
                 ResourcePackResponseResult::Downloaded
                 | ResourcePackResponseResult::DownloadSuccess
-                | ResourcePackResponseResult::Accepted
                 | ResourcePackResponseResult::Discarded
                 | ResourcePackResponseResult::Unknown(_) => {}
                 ResourcePackResponseResult::Declined => {
                     if resource_config.force {
                         self.kick(TextComponent::text("Required resource pack was declined"))
                             .await;
+                        return;
                     }
                 }
                 ResourcePackResponseResult::DownloadFail => {
                     if resource_config.force {
                         self.kick(TextComponent::text("Failed to download resource pack"))
                             .await;
+                        return;
                     }
                 }
                 ResourcePackResponseResult::InvalidUrl => {
                     self.kick(TextComponent::text("Invalid resource pack URL"))
                         .await;
+                    return;
                 }
                 ResourcePackResponseResult::ReloadFailed => {
                     self.kick(TextComponent::text("Failed to reload resource pack"))
                         .await;
+                    return;
                 }
             }
+        }
+
+        // Продолжить конфигурацию. Отправив пак, `handle_login_acknowledged`
+        // не шлёт известные наборы данных — их ждёт именно этот обработчик, и
+        // без них клиент навсегда остаётся на экране «Joining world».
+        // Развилка по версии — та же, что там.
+        if self.version.load() >= JavaMinecraftVersion::V_1_20_5 {
+            self.send_known_packs().await;
+        } else {
+            self.handle_known_packs().await;
         }
     }
 
