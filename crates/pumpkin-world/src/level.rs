@@ -733,9 +733,17 @@ impl Level {
                     while let Some(data) = rx.recv().await {
                         match data {
                             LoadedData::Loaded(chunk) => {
-                                let pos = Vector2::new(chunk.x, chunk.z);
-                                level.loaded_entity_chunks.insert(pos, chunk.clone());
-                                let _ = sender.send((Arc::downgrade(&chunk), true)).await;
+                                // Deciding "first load" has to be atomic with the
+                                // insert. `fetch_chunks` re-reads the region file and
+                                // hands out a FRESH `Arc` on every call, so two
+                                // in-flight fetches of the same position yield two
+                                // independent copies, each holding the complete
+                                // serialized entity list. Announcing `true` for both
+                                // makes the receiver consume both lists and spawn
+                                // every entity twice.
+                                let (chunk, first_load) =
+                                    claim_entity_chunk(&level.loaded_entity_chunks, chunk);
+                                let _ = sender.send((Arc::downgrade(&chunk), first_load)).await;
                             }
                             LoadedData::Missing(pos) | LoadedData::Error((pos, _)) => {
                                 let (tx, rx) = oneshot::channel();
@@ -776,8 +784,12 @@ impl Level {
         }
 
         if let Ok((chunk, _)) = self.load_single_entity_chunk(pos).await {
-            self.loaded_entity_chunks.insert(pos, chunk.clone());
-            chunk
+            // Another task may have installed this chunk while we were reading it
+            // off disk. Overwriting the entry would replace a chunk whose entities
+            // are already live with a pristine copy straight from the file, and the
+            // caller (`World::save_entity`) would then append the live entity on top
+            // of the very entities it was made from.
+            claim_entity_chunk(&self.loaded_entity_chunks, chunk).0
         } else {
             let (tx, rx) = oneshot::channel();
             match self.pending_entity_generations.entry(pos) {
@@ -998,10 +1010,41 @@ impl Level {
     }
 }
 
+/// Registers a freshly read entity chunk as the loaded one for its position.
+///
+/// Returns the chunk that is now authoritative for that position together with
+/// whether *this* call is the one that made it live.
+///
+/// This exists because [`crate::chunk::io::FileIO::fetch_chunks`] has no cache of
+/// parsed chunks: it re-reads the region file and wraps the result in a brand new
+/// `Arc` for every request. Two requests for the same position that overlap in
+/// time therefore produce two independent chunks, each carrying a full copy of the
+/// serialized entity list. Whoever consumes that list (see `World::spawn_world_entity_chunks`)
+/// must be told exactly once, or every entity in the chunk is spawned as many times
+/// as the reads overlapped — and each live copy is then written back to disk on
+/// unload, so the duplicates persist and accumulate across sessions.
+///
+/// Checking the map and inserting into it as two steps is not enough; the decision
+/// has to happen under the map's own lock.
+fn claim_entity_chunk(
+    loaded: &DashMap<Vector2<i32>, SyncEntityChunk>,
+    chunk: SyncEntityChunk,
+) -> (SyncEntityChunk, bool) {
+    let pos = Vector2::new(chunk.x, chunk.z);
+    match loaded.entry(pos) {
+        Entry::Occupied(entry) => (entry.get().clone(), false),
+        Entry::Vacant(entry) => {
+            entry.insert(chunk.clone());
+            (chunk, true)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pumpkin_config::world::LevelConfig;
+    use pumpkin_nbt::compound::NbtCompound;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -1057,5 +1100,73 @@ mod tests {
 
         let end_level = Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_END);
         assert_eq!(end_level.level_folder.dim_folder, root.join("DIM1"));
+    }
+
+    /// Builds an entity chunk holding `count` entities, as a fresh read off disk
+    /// would produce it.
+    fn read_from_disk(pos: Vector2<i32>, count: usize) -> SyncEntityChunk {
+        let mut data = Vec::new();
+        for i in 0..count {
+            let mut nbt = NbtCompound::new();
+            nbt.put_string("id", "minecraft:villager".to_string());
+            nbt.put_int("test_index", i as i32);
+            data.push(nbt);
+        }
+        Arc::new(ChunkEntityData {
+            x: pos.x,
+            z: pos.y,
+            data: std::sync::Mutex::new(data),
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn only_one_read_of_a_position_is_announced_as_the_first() {
+        // The regression this guards: `fetch_chunks` returns a fresh `Arc` per
+        // call, so overlapping reads of one position each carry a complete entity
+        // list. If more than one of them is announced as the first load, the
+        // caller consumes every list and the chunk's entities are spawned once
+        // per overlapping read.
+        let loaded: DashMap<Vector2<i32>, SyncEntityChunk> = DashMap::new();
+        let pos = Vector2::new(4, -7);
+
+        let firsts = (0..5)
+            .filter(|_| claim_entity_chunk(&loaded, read_from_disk(pos, 3)).1)
+            .count();
+
+        assert_eq!(firsts, 1, "{firsts} reads claimed to be the first one");
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn later_reads_hand_back_the_chunk_that_is_already_live() {
+        // Returning the pristine copy instead would resurrect entities that the
+        // first load already took ownership of.
+        let loaded: DashMap<Vector2<i32>, SyncEntityChunk> = DashMap::new();
+        let pos = Vector2::new(0, 0);
+
+        let (live, first) = claim_entity_chunk(&loaded, read_from_disk(pos, 2));
+        assert!(first);
+        // The first load consumes the serialized list; the entities are live now.
+        live.data.lock().unwrap().clear();
+
+        let (again, first) = claim_entity_chunk(&loaded, read_from_disk(pos, 2));
+        assert!(!first);
+        assert!(
+            Arc::ptr_eq(&live, &again),
+            "a second copy replaced the live chunk"
+        );
+        assert!(
+            again.data.lock().unwrap().is_empty(),
+            "the already consumed entity list came back from disk"
+        );
+    }
+
+    #[test]
+    fn distinct_positions_are_independent() {
+        let loaded: DashMap<Vector2<i32>, SyncEntityChunk> = DashMap::new();
+        assert!(claim_entity_chunk(&loaded, read_from_disk(Vector2::new(1, 1), 1)).1);
+        assert!(claim_entity_chunk(&loaded, read_from_disk(Vector2::new(1, 2), 1)).1);
+        assert_eq!(loaded.len(), 2);
     }
 }
