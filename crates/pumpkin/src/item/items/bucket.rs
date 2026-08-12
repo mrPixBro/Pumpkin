@@ -6,7 +6,7 @@ use crate::{
     item::{ItemBehaviour, ItemMetadata},
 };
 use pumpkin_data::{
-    Block, BlockDirection,
+    Block, BlockDirection, BlockStateId,
     entity::EntityType,
     fluid::Fluid,
     item::Item,
@@ -145,62 +145,112 @@ fn give_player_bucket_item(player: &Player, item: &'static Item) {
     }
 }
 
-pub(crate) fn try_pickup_fluid_at(
-    world: &Arc<World>,
-    block_pos: BlockPos,
-) -> Option<&'static Item> {
+/// What filling a bucket is about to do to the world.
+///
+/// Planning is kept apart from doing for one reason: `PlayerBucketFillEvent`
+/// has to be fired **before** the fluid is gone, or cancelling it takes the
+/// bucket away from the player and leaves the drained pond drained. A plugin
+/// also needs the position that actually changes — it may be the block the
+/// player looked at or the one behind it.
+enum BucketFill {
+    /// Scoop up a powder snow block.
+    PowderSnow(BlockPos),
+    /// Drain the water out of a waterlogged block.
+    Drain(BlockPos),
+    /// Take the fluid source itself.
+    Source(BlockPos, &'static Item),
+}
+
+impl BucketFill {
+    const fn position(&self) -> BlockPos {
+        match self {
+            Self::PowderSnow(pos) | Self::Drain(pos) | Self::Source(pos, _) => *pos,
+        }
+    }
+
+    const fn item(&self) -> &'static Item {
+        match self {
+            Self::PowderSnow(_) => &Item::POWDER_SNOW_BUCKET,
+            Self::Drain(_) => &Item::WATER_BUCKET,
+            Self::Source(_, item) => item,
+        }
+    }
+}
+
+/// What a bucket would pick up at `block_pos` itself, ignoring the clicked face.
+fn plan_bucket_fill_at(world: &Arc<World>, block_pos: BlockPos) -> Option<BucketFill> {
     let (block, state) = world.get_block_and_state_id(&block_pos);
 
     if block == &Block::POWDER_SNOW {
-        world.break_block(
-            &block_pos,
-            None,
-            BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS,
-        );
-        return Some(&Item::POWDER_SNOW_BUCKET);
+        return Some(BucketFill::PowderSnow(block_pos));
     }
 
     if block.is_waterlogged(state) {
-        let state_id = block.set_waterlogged(state, false).unwrap_or(state);
-        world.set_block_state(&block_pos, state_id, BlockFlags::NOTIFY_ALL);
-        world.schedule_fluid_tick(&Fluid::WATER, block_pos, 5, TickPriority::Normal);
-        return Some(&Item::WATER_BUCKET);
+        return Some(BucketFill::Drain(block_pos));
     }
 
     if state == Block::LAVA.default_state.id || state == Block::WATER.default_state.id {
-        world.break_block(&block_pos, None, BlockFlags::NOTIFY_ALL);
-        world.set_block_state(
-            &block_pos,
-            Block::AIR.default_state.id,
-            BlockFlags::NOTIFY_ALL,
-        );
-        return Some(if state == Block::LAVA.default_state.id {
-            &Item::LAVA_BUCKET
-        } else {
-            &Item::WATER_BUCKET
-        });
+        return Some(BucketFill::Source(
+            block_pos,
+            if state == Block::LAVA.default_state.id {
+                &Item::LAVA_BUCKET
+            } else {
+                &Item::WATER_BUCKET
+            },
+        ));
     }
 
     None
 }
 
-fn try_pickup_bucket_item(
+/// The same, plus the block behind the clicked face: a waterlogged block is
+/// drained through the side the player pointed at.
+fn plan_bucket_fill(
     world: &Arc<World>,
     block_pos: BlockPos,
     direction: BlockDirection,
-) -> Option<&'static Item> {
-    if let Some(item) = try_pickup_fluid_at(world, block_pos) {
-        return Some(item);
+) -> Option<BucketFill> {
+    if let Some(fill) = plan_bucket_fill_at(world, block_pos) {
+        return Some(fill);
     }
 
     let target_pos = block_pos.offset(direction.to_offset());
     let (block, state) = world.get_block_and_state_id(&target_pos);
+    block
+        .set_waterlogged(state, false)
+        .map(|_| BucketFill::Drain(target_pos))
+}
 
-    let unwaterlogged = block.set_waterlogged(state, false)?;
+fn apply_bucket_fill(world: &Arc<World>, fill: &BucketFill) {
+    match fill {
+        BucketFill::PowderSnow(pos) => {
+            world.break_block(pos, None, BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS);
+        }
+        BucketFill::Drain(pos) => {
+            let (block, state) = world.get_block_and_state_id(pos);
+            let state_id = block.set_waterlogged(state, false).unwrap_or(state);
+            world.set_block_state(pos, state_id, BlockFlags::NOTIFY_ALL);
+            world.schedule_fluid_tick(&Fluid::WATER, *pos, 5, TickPriority::Normal);
+        }
+        BucketFill::Source(pos, _) => {
+            world.break_block(pos, None, BlockFlags::NOTIFY_ALL);
+            world.set_block_state(pos, Block::AIR.default_state.id, BlockFlags::NOTIFY_ALL);
+        }
+    }
+}
 
-    world.set_block_state(&target_pos, unwaterlogged, BlockFlags::NOTIFY_ALL);
-    world.schedule_fluid_tick(&Fluid::WATER, target_pos, 5, TickPriority::Normal);
-    Some(&Item::WATER_BUCKET)
+/// Tries to pick up powder snow, a waterlogged block, or a fluid source block at `block_pos`,
+/// returning the matching filled bucket item on success.
+///
+/// Plans and applies in one go: a dispenser fires no player event, so there is
+/// nothing to ask in between.
+pub(crate) fn try_pickup_fluid_at(
+    world: &Arc<World>,
+    block_pos: BlockPos,
+) -> Option<&'static Item> {
+    let fill = plan_bucket_fill_at(world, block_pos)?;
+    apply_bucket_fill(world, &fill);
+    Some(fill.item())
 }
 
 pub(crate) const fn should_evaporate_in_nether(item: &Item, world: &World) -> bool {
@@ -219,41 +269,56 @@ pub(crate) fn play_bucket_evaporation(world: &Arc<World>, position: &Vector3<f64
     );
 }
 
-fn try_place_powder_snow(world: &Arc<World>, pos: BlockPos, direction: BlockDirection) -> bool {
-    let state = world.get_block_state(&pos);
-    let target_pos = if state.replaceable() {
-        pos
-    } else {
-        pos.offset(direction.to_offset())
-    };
-    let target_state = world.get_block_state(&target_pos);
-    if !target_state.is_air() && !target_state.is_liquid() && !target_state.replaceable() {
-        return false;
-    }
-    world.set_block_state(
-        &target_pos,
-        Block::POWDER_SNOW.default_state.id,
-        BlockFlags::NOTIFY_NEIGHBORS,
-    );
-    true
+/// What emptying a bucket is about to do to the world.
+///
+/// Split from doing it for the same reason as [`BucketFill`]:
+/// `PlayerBucketEmptyEvent` used to be fired *after* the fluid had already been
+/// poured and its `cancelled` flag was never read, so a plugin could not stop
+/// anyone from flooding anything. The position matters just as much — the fluid
+/// rarely lands in the block the player clicked.
+enum BucketEmpty {
+    /// Place a powder snow block.
+    PowderSnow(BlockPos),
+    /// Fill a waterloggable block with water.
+    Waterlog(BlockPos, BlockStateId),
+    /// Place a fluid source.
+    Source(BlockPos, BlockStateId),
 }
 
-pub(crate) fn try_place_filled_bucket(
+impl BucketEmpty {
+    const fn position(&self) -> BlockPos {
+        match self {
+            Self::PowderSnow(pos) | Self::Waterlog(pos, _) | Self::Source(pos, _) => *pos,
+        }
+    }
+}
+
+fn plan_bucket_empty(
     world: &Arc<World>,
     item: &Item,
     pos: BlockPos,
     direction: BlockDirection,
-) -> bool {
-    let (block, state) = world.get_block_and_state(&pos);
+) -> Option<BucketEmpty> {
     if item.id == Item::POWDER_SNOW_BUCKET.id {
-        return try_place_powder_snow(world, pos, direction);
+        let state = world.get_block_state(&pos);
+        let target_pos = if state.replaceable() {
+            pos
+        } else {
+            pos.offset(direction.to_offset())
+        };
+        let target_state = world.get_block_state(&target_pos);
+        if !target_state.is_air() && !target_state.is_liquid() && !target_state.replaceable() {
+            return None;
+        }
+        return Some(BucketEmpty::PowderSnow(target_pos));
     }
 
+    let (block, state) = world.get_block_and_state(&pos);
     if item.id == Item::WATER_BUCKET.id && block.is_waterlogged(state.id) {
-        let state_id = block.set_waterlogged(state.id, true).unwrap_or(state.id);
-        world.set_block_state(&pos, state_id, BlockFlags::NOTIFY_ALL);
-        world.schedule_fluid_tick(&Fluid::WATER, pos, 5, TickPriority::Normal);
-        return true;
+        return Some(BucketEmpty::Waterlog(
+            pos,
+            block.set_waterlogged(state.id, true).unwrap_or(state.id),
+        ));
     }
 
     let target_pos = pos.offset(direction.to_offset());
@@ -261,28 +326,59 @@ pub(crate) fn try_place_filled_bucket(
 
     if block.is_waterloggable() {
         if item.id == Item::LAVA_BUCKET.id {
-            return false;
+            return None;
         }
-        let state_id = block.set_waterlogged(state.id, true).unwrap_or(state.id);
-        world.set_block_state(&target_pos, state_id, BlockFlags::NOTIFY_ALL);
-        world.schedule_fluid_tick(&Fluid::WATER, target_pos, 5, TickPriority::Normal);
-        return true;
+        return Some(BucketEmpty::Waterlog(
+            target_pos,
+            block.set_waterlogged(state.id, true).unwrap_or(state.id),
+        ));
     }
 
     if state.id == Block::AIR.default_state.id || state.is_liquid() {
-        world.set_block_state(
-            &target_pos,
+        return Some(BucketEmpty::Source(
+            target_pos,
             if item.id == Item::LAVA_BUCKET.id {
                 Block::LAVA.default_state.id
             } else {
                 Block::WATER.default_state.id
             },
-            BlockFlags::NOTIFY_ALL,
-        );
-        return true;
+        ));
     }
 
-    false
+    None
+}
+
+fn apply_bucket_empty(world: &Arc<World>, empty: &BucketEmpty) {
+    match empty {
+        BucketEmpty::PowderSnow(pos) => {
+            world.set_block_state(
+                pos,
+                Block::POWDER_SNOW.default_state.id,
+                BlockFlags::NOTIFY_NEIGHBORS,
+            );
+        }
+        BucketEmpty::Waterlog(pos, state_id) => {
+            world.set_block_state(pos, *state_id, BlockFlags::NOTIFY_ALL);
+            world.schedule_fluid_tick(&Fluid::WATER, *pos, 5, TickPriority::Normal);
+        }
+        BucketEmpty::Source(pos, state_id) => {
+            world.set_block_state(pos, *state_id, BlockFlags::NOTIFY_ALL);
+        }
+    }
+}
+
+/// Plans and applies in one go, for callers with no player event to fire.
+pub(crate) fn try_place_filled_bucket(
+    world: &Arc<World>,
+    item: &Item,
+    pos: BlockPos,
+    direction: BlockDirection,
+) -> bool {
+    let Some(empty) = plan_bucket_empty(world, item, pos, direction) else {
+        return false;
+    };
+    apply_bucket_empty(world, &empty);
+    true
 }
 
 impl ItemBehaviour for EmptyBucketItem {
@@ -308,18 +404,20 @@ impl ItemBehaviour for EmptyBucketItem {
             return;
         };
 
-        let Some(item) = try_pickup_bucket_item(&world, block_pos, direction) else {
+        let Some(fill) = plan_bucket_fill(&world, block_pos, direction) else {
             return;
         };
 
+        // Ask BEFORE draining. Fired after the fact, cancelling only took the
+        // bucket away from the player: the pond stayed drained either way.
         if let Some(server) = world.server.upgrade()
             && let Some(player_arc) = world.get_player_by_uuid(player.gameprofile.id)
         {
             let mut event =
                 crate::plugin::api::events::player::player_bucket::PlayerBucketFillEvent::new(
                     player_arc,
-                    block_pos,
-                    item.registry_key.to_string(),
+                    fill.position(),
+                    fill.item().registry_key.to_string(),
                 );
             server.plugin_manager.fire_blocking(&server, &mut event);
             if event.cancelled {
@@ -327,13 +425,15 @@ impl ItemBehaviour for EmptyBucketItem {
             }
         }
 
+        apply_bucket_fill(&world, &fill);
+
         world.play_sound(
-            get_fill_sound(item),
+            get_fill_sound(fill.item()),
             SoundCategory::Blocks,
-            &block_pos.to_f64(),
+            &fill.position().to_f64(),
         );
 
-        give_player_bucket_item(player, item);
+        give_player_bucket_item(player, fill.item());
     }
 
     fn use_on_entity(&self, _item: &mut ItemStack, player: &Player, entity: Arc<dyn EntityBase>) {
@@ -388,31 +488,33 @@ impl ItemBehaviour for FilledBucketItem {
             play_bucket_evaporation(&world, &player.position());
             return;
         }
-        if !try_place_filled_bucket(&world, item, pos, direction) {
+        let Some(empty) = plan_bucket_empty(&world, item, pos, direction) else {
             return;
-        }
+        };
+        let place_pos = empty.position();
 
+        // Ask BEFORE pouring, and about the block the fluid actually lands in
+        // — it is the one behind the clicked face far more often than not.
+        // Fired after the fact and with its `cancelled` never read, this event
+        // protected nothing at all. Reading the position back off the world
+        // after the change cannot work either: by then the block already looks
+        // like what the bucket made of it.
         if let Some(server) = world.server.upgrade()
             && let Some(player_arc) = world.get_player_by_uuid(player.gameprofile.id)
         {
             let mut event =
                 crate::plugin::api::events::player::player_bucket::PlayerBucketEmptyEvent::new(
                     player_arc,
-                    pos,
+                    place_pos,
                     item.registry_key.to_string(),
                 );
             server.plugin_manager.fire_blocking(&server, &mut event);
+            if event.cancelled {
+                return;
+            }
         }
 
-        let place_pos = if world
-            .get_block_and_state(&pos)
-            .0
-            .is_waterlogged(world.get_block_state_id(&pos))
-        {
-            pos
-        } else {
-            pos.offset(direction.to_offset())
-        };
+        apply_bucket_empty(&world, &empty);
 
         world.play_sound(
             get_empty_sound(item),
