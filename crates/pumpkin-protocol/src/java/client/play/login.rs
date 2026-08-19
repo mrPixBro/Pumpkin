@@ -390,6 +390,7 @@ mod tests {
 
         let spawn_data = PlayerSpawnData::new(
             Dimension::OVERWORLD,
+            "minecraft:overworld".to_string(),
             123456789,
             0,
             -1,

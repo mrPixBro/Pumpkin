@@ -266,6 +266,10 @@ pub struct World {
     pub level_time: std::sync::Mutex<LevelTime>,
     /// The type of dimension the world is in.
     pub dimension: Dimension,
+    /// The key the client uses to tell worlds apart. Equals
+    /// `dimension.minecraft_name` for the vanilla three; extra worlds get
+    /// `pumpkin:<folder>` so the client rebuilds its level on transfer.
+    pub level_key: String,
     pub sea_level: i32,
     pub min_y: i32,
     /// The world's weather, including rain and thunder levels.
@@ -360,6 +364,7 @@ impl World {
         level: Arc<Level>,
         level_info: Arc<ArcSwap<LevelData>>,
         dimension: Dimension,
+        level_key: String,
         block_registry: Arc<BlockRegistry>,
         server: Weak<Server>,
     ) -> Self {
@@ -404,6 +409,7 @@ impl World {
             )),
             level_time: std::sync::Mutex::new(LevelTime::new()),
             dimension,
+            level_key,
             weather: std::sync::Mutex::new(Weather::new()),
             block_registry,
             sea_level: generation_settings.sea_level,
@@ -3341,10 +3347,13 @@ impl World {
         player: &Arc<Player>,
         server: &Arc<Server>,
     ) {
+        // Level keys of every world, not dimension types: the client needs to
+        // know the key of each world we might transfer it into.
         let dimensions: Vec<ResourceLocation> = server
-            .dimensions
+            .worlds
+            .load()
             .iter()
-            .map(|d| ResourceLocation::from(d.minecraft_name))
+            .map(|w| ResourceLocation::from(w.level_key.as_str()))
             .collect();
 
         // This code follows the vanilla packet order
@@ -3390,6 +3399,7 @@ impl World {
                 false,
                 PlayerSpawnData::new(
                     self.dimension.clone(),
+                    self.level_key.clone(),
                     biome::hash_seed(self.level.seed.0), // seed
                     gamemode as u8,
                     player
@@ -4509,6 +4519,7 @@ impl World {
             .send_client_packet(&CRespawn::new(
                 PlayerSpawnData::new(
                     target_world.dimension.clone(),
+                    target_world.level_key.clone(),
                     biome::hash_seed(target_world.level.seed.0),
                     player.gamemode.load() as u8,
                     player.gamemode.load() as i8,

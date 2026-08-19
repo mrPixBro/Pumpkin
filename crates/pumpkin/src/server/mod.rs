@@ -397,6 +397,7 @@ impl Server {
                 level.clone(),
                 server.level_info.clone(),
                 dim.clone(),
+                dim.minecraft_name.to_string(),
                 block_registry.clone(),
                 Arc::downgrade(&server),
             ));
@@ -473,6 +474,7 @@ impl Server {
             }
         }
 
+        let level_key = format!("pumpkin:{name}");
         let world_path = self.basic_config.get_world_path().join(name);
         let registry = self.block_registry.clone();
         let l_info = self.level_info.clone();
@@ -482,7 +484,9 @@ impl Server {
 
         let level =
             pumpkin_world::dimension::into_level(dimension.clone(), &config, world_path, seed);
-        let world: World = World::load(level.clone(), l_info, dimension, registry, weak);
+        // A world that does not share the client's dimension type is told
+        // apart by its level key alone, so give every extra world its own.
+        let world: World = World::load(level.clone(), l_info, dimension, level_key, registry, weak);
         let world = Arc::new(world);
         let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
         level.world_portal.store(Arc::new(Some(portal)));

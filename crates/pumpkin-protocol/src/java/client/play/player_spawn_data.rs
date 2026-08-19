@@ -12,6 +12,12 @@ use crate::{
 pub struct PlayerSpawnData {
     /// The Dimension for the current dimension's properties (lighting, sky color).
     pub dimension: Dimension,
+    /// The level key sent to the client (`minecraft:overworld`, `pumpkin:spawn`).
+    ///
+    /// Kept apart from `dimension.minecraft_name` on purpose: the client keys its
+    /// `ClientLevel` off this string, so two worlds sharing a dimension type must
+    /// still differ here or the client reuses the old level and its chunks.
+    pub level_key: String,
     /// Used by the client to seed local biome noise and decoration algorithms.
     pub hashed_seed: i64,
     pub game_mode: u8,
@@ -34,6 +40,7 @@ impl PlayerSpawnData {
     #[must_use]
     pub const fn new(
         dimension: Dimension,
+        level_key: String,
         hashed_seed: i64,
         game_mode: u8,
         previous_gamemode: i8,
@@ -45,6 +52,7 @@ impl PlayerSpawnData {
     ) -> Self {
         Self {
             dimension,
+            level_key,
             hashed_seed,
             game_mode,
             previous_gamemode,
@@ -70,7 +78,7 @@ impl PlayerSpawnData {
         } else {
             write.write_i8(self.dimension.id as i8)?;
         }
-        write.write_string(self.dimension.minecraft_name)?;
+        write.write_string(&self.level_key)?;
         write.write_i64_be(self.hashed_seed)?;
         write.write_u8(self.game_mode)?;
         write.write_i8(self.previous_gamemode)?;
@@ -122,7 +130,7 @@ impl PlayerSpawnData {
             }
         };
 
-        let _world_name = read.get_str()?;
+        let level_key = read.get_str()?.to_string();
         let hashed_seed = read.get_i64_be()?;
         let game_mode = read.get_u8()?;
         let previous_gamemode = read.get_i8()?;
@@ -155,6 +163,7 @@ impl PlayerSpawnData {
 
         Ok(Self {
             dimension,
+            level_key,
             hashed_seed,
             game_mode,
             previous_gamemode,

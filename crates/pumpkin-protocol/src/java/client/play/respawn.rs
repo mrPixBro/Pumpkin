@@ -145,6 +145,8 @@ impl<'a> ServerPacket<'a> for CRespawn {
 
             let player_spawn_info = PlayerSpawnData::new(
                 dimension,
+                // Before 1.16 the packet carries no world name at all.
+                String::new(),
                 hashed_seed,
                 game_mode,
                 -1,
@@ -175,7 +177,7 @@ impl<'a> ServerPacket<'a> for CRespawn {
                     .unwrap_or(Dimension::OVERWORLD)
             };
 
-            let _world_name = read.get_str()?;
+            let level_key = read.get_str()?.to_string();
             let hashed_seed = read.get_i64_be()?;
             let game_mode = read.get_u8()?;
             let previous_gamemode = read.get_i8()?;
@@ -210,6 +212,7 @@ impl<'a> ServerPacket<'a> for CRespawn {
 
             let player_spawn_info = PlayerSpawnData::new(
                 dimension,
+                level_key,
                 hashed_seed,
                 game_mode,
                 previous_gamemode,
