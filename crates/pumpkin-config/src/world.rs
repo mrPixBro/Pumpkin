@@ -15,11 +15,35 @@ pub struct LevelConfig {
     /// Number of ticks between autosave checks. If 0, autosave is disabled.
     #[serde(default = "default_autosave_ticks")]
     pub autosave_ticks: u64,
+    /// Additional worlds (hub, dungeon, afk). Empty by default — only the
+    /// vanilla trio is loaded.
+    #[serde(default)]
+    pub extra: Vec<ExtraWorld>,
     // TODO: More options
 }
 
 const fn default_autosave_ticks() -> u64 {
     6000 // Default to 5 minutes at 20 TPS
+}
+
+/// An additional world loaded alongside the vanilla trio.
+///
+/// The dimension type is always overworld: `into_level` pushes nether/end
+/// into the `DIM-1`/`DIM1` path, and such a world's folder name would
+/// collide with the actual nether.
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ExtraWorld {
+    /// Folder name inside the world folder. This is also the world's
+    /// identifier for plugins.
+    pub name: String,
+    /// `"void"` — empty space beyond generated chunks, `"vanilla"` — normal
+    /// generation with the same seed as the main world.
+    #[serde(default = "default_generator")]
+    pub generator: String,
+}
+
+fn default_generator() -> String {
+    "void".to_string()
 }
 
 impl Default for LevelConfig {
@@ -28,6 +52,7 @@ impl Default for LevelConfig {
             chunk: ChunkConfig::default(),
             lighting: LightingEngineConfig::default(),
             autosave_ticks: default_autosave_ticks(),
+            extra: Vec::new(),
         }
     }
 }

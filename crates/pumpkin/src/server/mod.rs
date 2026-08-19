@@ -406,6 +406,46 @@ impl Server {
             worlds_vec.push(world);
         }
 
+        // Extra worlds: own folder inside the world folder, own level key,
+        // dimension type is always overworld.
+        for extra in &server.advanced_config.world.extra {
+            info!(
+                "Loading {}",
+                TextComponent::text(extra.name.clone())
+                    .color_named(NamedColor::DarkGreen)
+                    .to_pretty_console()
+            );
+            let config = Arc::new(server.advanced_config.world.clone());
+            let dim = Dimension::OVERWORLD;
+            let level = into_level(dim.clone(), &config, world_path.join(&extra.name), seed);
+            if extra.generator == "void" {
+                // Empty layer list — plain air: FlatGenerator is a no-op
+                // on every step but laying out layers, so no structures
+                // or carvers appear here.
+                level.set_world_gen(Arc::new(
+                    pumpkin_world::generation::generator::WorldGenerator::Flat(Box::new(
+                        pumpkin_world::generation::generator::flat::FlatGenerator::new(
+                            pumpkin_util::world_seed::Seed(seed as u64),
+                            dim.clone(),
+                            Vec::new(),
+                            "minecraft:the_void".to_string(),
+                        ),
+                    )),
+                ));
+            }
+            let world = Arc::new(World::load(
+                level.clone(),
+                server.level_info.clone(),
+                dim,
+                format!("pumpkin:{}", extra.name),
+                block_registry.clone(),
+                Arc::downgrade(&server),
+            ));
+            let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
+            level.world_portal.store(Arc::new(Some(portal)));
+            worlds_vec.push(world);
+        }
+
         for world in &worlds_vec {
             let mut world_init_event =
                 crate::plugin::api::events::world::world_init::WorldInitEvent::new(world.clone());
