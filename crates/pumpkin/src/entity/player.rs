@@ -6631,6 +6631,10 @@ impl EntityBase for Player {
             "Dimension",
             self.world().dimension.minecraft_name.to_string(),
         );
+        // Keep the dimension type as-is — external tools read it. Store
+        // the folder name alongside it: only that distinguishes two
+        // worlds of the same dimension type.
+        nbt.put_string("WorldName", self.world().get_world_name().to_string());
 
         if let Some(respawn) = self
             .respawn_point

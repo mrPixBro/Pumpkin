@@ -632,18 +632,52 @@ impl Server {
         let first_world = self.worlds.load().first().cloned()?;
 
         let (world, nbt) = if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
-            if let Some(dimension_key) = data.get_string("Dimension") {
-                if let Some(dimension) = Dimension::from_name(dimension_key) {
-                    let world = self.get_world_from_dimension(dimension);
-                    (world, Some(data))
-                } else {
-                    warn!("Invalid dimension key in player data: {dimension_key}");
-                    (first_world, Some(data))
-                }
-            } else {
-                // Player data exists but doesn't have a "Dimension" key.
-                (first_world, Some(data))
-            }
+            // Folder name first — it is the only thing that distinguishes
+            // two worlds of the same dimension type. Then the old
+            // dimension key, to accept player data written before this
+            // change. Missing both falls back to the hub (first world);
+            // that must NEVER mean losing the player's data.
+            //
+            // Both fallback steps log a warning: a silent fallback here
+            // is undiagnosable from the server log when a player ends up
+            // in the wrong world.
+            let resolve_by_dimension = || {
+                data.get_string("Dimension")
+                    .and_then(|key| {
+                        let dimension = Dimension::from_name(key);
+                        if dimension.is_none() {
+                            warn!("Invalid dimension key in player data: {key}");
+                        }
+                        dimension
+                    })
+                    .map(|dim| self.get_world_from_dimension(dim))
+            };
+
+            let world = data.get_string("WorldName").map_or_else(
+                || resolve_by_dimension().unwrap_or_else(|| first_world.clone()),
+                |name| {
+                    self.worlds
+                        .load()
+                        .iter()
+                        .find(|w| w.get_world_name() == name)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            // WorldName was present but points at a world
+                            // that no longer exists (e.g. an admin removed
+                            // it from the config). Log where the player will
+                            // actually land so this is diagnosable.
+                            let landing =
+                                resolve_by_dimension().unwrap_or_else(|| first_world.clone());
+                            warn!(
+                                "Player data referenced world '{name}', which no longer exists; \
+                                 falling back to '{}'",
+                                landing.get_world_name()
+                            );
+                            landing
+                        })
+                },
+            );
+            (world, Some(data))
         } else {
             // No player data found or an error occurred, default to the Overworld.
             (first_world, None)
