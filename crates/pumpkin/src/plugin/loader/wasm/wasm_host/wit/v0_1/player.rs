@@ -3753,6 +3753,25 @@ impl pumpkin::plugin::player::HostJavaPlayer for PluginHostState {
             .client
             .java()
             .ok_or_else(|| wasmtime::Error::msg("Not a java player"))?;
+
+        // Closing a screen is not just bytes on the wire. `close_handled_screen`
+        // also runs `on_handled_screen_closed`, which puts the player's own
+        // inventory back into `current_screen_handler`. Writing the raw packet
+        // skips that half: the client closes the window and does not echo
+        // `SCloseContainer` back, so the server keeps the stale handler. Every
+        // later click in the player's own inventory (sync id 0) then dies on the
+        // sync-id guard at the top of `on_slot_click`, and the inventory stays
+        // frozen until some container is opened again. Route the packet through
+        // the real close path instead — it also reads the sync id off the live
+        // handler, so a plugin does not have to know one it cannot look up.
+        if matches!(
+            packet,
+            pumpkin::plugin::java_packets::ClientboundPacket::CCloseContainer(_)
+        ) {
+            player.close_handled_screen();
+            return Ok(());
+        }
+
         if let Some(bytes) = crate::plugin::loader::wasm::wasm_host::wit::v0_1::generated_packets::serialize_java_packet(
             &packet, client.version.load(),
         ) {
