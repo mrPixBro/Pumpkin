@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    fs,
-    path::Path,
-};
+use std::{collections::HashSet, fs, path::Path};
 
 use heck::{ToPascalCase, ToShoutySnakeCase};
 use proc_macro2::TokenStream;
@@ -222,11 +218,29 @@ fn state_provider_to_tokens(provider: &StateProviderJson) -> TokenStream {
     }
 }
 
+#[derive(Deserialize, Debug)]
+struct BlockNameJson {
+    name: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct BlockAssetsJson {
+    blocks: Vec<BlockNameJson>,
+}
+
+/// Names of the blocks this build knows about; rules naming anything else are dropped.
+fn valid_block_names(blocks_json: &str) -> HashSet<String> {
+    let blocks_file: BlockAssetsJson =
+        serde_json::from_str(blocks_json).expect("Failed to parse blocks.json");
+    blocks_file
+        .blocks
+        .into_iter()
+        .map(|block| block.name)
+        .collect()
+}
+
 pub fn build() -> TokenStream {
-    let blocks_file: BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(&fs::read_to_string("../../assets/blocks.json").unwrap())
-            .expect("Failed to parse blocks.json");
-    let valid_blocks: HashSet<String> = blocks_file.into_keys().collect();
+    let valid_blocks = valid_block_names(&fs::read_to_string("../../assets/blocks.json").unwrap());
 
     let dir = Path::new("../../assets/datapacks/26_2/data/minecraft/block_transformer");
     let mut files: Vec<(String, Vec<TransformerEntryJson>)> = Vec::new();
@@ -493,5 +507,27 @@ pub fn build() -> TokenStream {
                 _ => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_block_names;
+
+    #[test]
+    fn valid_block_names_reads_the_block_list() {
+        let blocks_json = r#"{
+            "block_entity_types": ["chest"],
+            "shapes": [],
+            "blocks": [{ "name": "dirt_path" }, { "name": "grass_block" }]
+        }"#;
+
+        let names = valid_block_names(blocks_json);
+
+        assert!(names.contains("dirt_path"), "block names are the payload");
+        assert!(
+            !names.contains("blocks"),
+            "wrapper keys are not block names"
+        );
     }
 }
