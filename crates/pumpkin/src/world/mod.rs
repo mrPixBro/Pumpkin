@@ -6585,15 +6585,16 @@ impl World {
         from: Vector3<f64>,
         to: Vector3<f64>,
     ) -> Option<(BlockDirection, Vector3<f64>)> {
-        let state = self.get_block_state(block_pos);
+        Self::outline_shape_hit(self.get_block_state(block_pos), block_pos, from, to)
+    }
 
-        if state.outline_shapes.is_empty() {
-            let block_min = block_pos.0.to_f64();
-            let block_max = block_min.add_raw(1.0, 1.0, 1.0);
-            return Self::intersects_aabb_with_hit(from, to, block_min, block_max)
-                .map(|(_, dir, hit_pos)| (dir, hit_pos));
-        }
-
+    fn outline_shape_hit(
+        state: &BlockState,
+        block_pos: &BlockPos,
+        from: Vector3<f64>,
+        to: Vector3<f64>,
+    ) -> Option<(BlockDirection, Vector3<f64>)> {
+        // A block without an outline (air) is never hit; it must not stand in for a full cube.
         let bounding_boxes = state.get_block_outline_shapes_at(block_pos);
         let mut closest_hit: Option<(f64, BlockDirection, Vector3<f64>)> = None;
 
@@ -6833,11 +6834,14 @@ impl World {
 
         let mut block = BlockPos::floored(from.x, from.y, from.z);
 
-        let (collision, direction) = self.ray_outline_check(&block, from, to);
-        if let Some(dir) = direction
-            && collision
-        {
-            return Some((block, dir));
+        // The block the ray starts in still has to satisfy the caller's check.
+        if hit_check(&block, self) {
+            let (collision, direction) = self.ray_outline_check(&block, from, to);
+            if let Some(dir) = direction
+                && collision
+            {
+                return Some((block, dir));
+            }
         }
 
         let difference = to.sub(&from);
@@ -7547,12 +7551,38 @@ pub fn calculate_celestial_angle(time_of_day: i64) -> f32 {
 #[cfg(test)]
 mod tests {
     use pumpkin_data::{
-        Block,
+        Block, BlockDirection,
         block_properties::{ChestLikeProperties, ChestType, HorizontalFacing},
     };
-    use pumpkin_util::math::position::BlockPos;
+    use pumpkin_util::math::{position::BlockPos, vector3::Vector3};
 
-    use super::{bedrock_block_breaking_rate, bedrock_chest_block_actor};
+    use super::{World, bedrock_block_breaking_rate, bedrock_chest_block_actor};
+
+    #[test]
+    fn outline_shape_hit_misses_a_block_without_an_outline() {
+        let position = BlockPos::new(0, 64, 0);
+        // A ray starting inside an outline-less block, as it does at the player's eyes.
+        let from = Vector3::new(0.5, 64.5, 0.5);
+        let to = Vector3::new(0.5, 60.5, 0.5);
+
+        assert!(
+            World::outline_shape_hit(Block::AIR.default_state, &position, from, to).is_none(),
+            "air has no outline and must not be hit"
+        );
+    }
+
+    #[test]
+    fn outline_shape_hit_reports_the_face_the_ray_entered() {
+        let position = BlockPos::new(0, 64, 0);
+        let from = Vector3::new(0.5, 70.0, 0.5);
+        let to = Vector3::new(0.5, 63.0, 0.5);
+
+        let (direction, hit_pos) =
+            World::outline_shape_hit(Block::STONE.default_state, &position, from, to).unwrap();
+
+        assert_eq!(direction, BlockDirection::Up);
+        assert!((hit_pos.y - 65.0).abs() < 1.0e-9);
+    }
 
     #[test]
     fn bedrock_block_breaking_rate_uses_progress_per_tick() {
